@@ -177,6 +177,11 @@ type webRTCConfig struct {
 	// a TCP stream, and unset it when proxying a UDP packets flow with its
 	// own reliability later, such as QUIC.
 	ReliableTransport bool
+
+	// OnConnectionEstablished is an optional callback that is invoked when a
+	// WebRTC connection is successfully established. The callback receives
+	// the selected ICE candidate pair statistics.
+	OnConnectionEstablished func(localCandidate, remoteCandidate ConnectionStats)
 }
 
 // newWebRTCConnWithOffer initiates a new WebRTC connection. An offer SDP is
@@ -1223,6 +1228,19 @@ func (conn *webRTCConn) getICECandidatePairsSummary() string {
 	return strings.Join(strs, ", ")
 }
 
+// toConnectionStats converts webrtc.ICECandidateStats to ConnectionStats.
+func toConnectionStats(stats webrtc.ICECandidateStats) ConnectionStats {
+	return ConnectionStats{
+		IP:            stats.IP,
+		Port:          int(stats.Port),
+		Protocol:      stats.Protocol,
+		CandidateType: stats.CandidateType.String(),
+		Priority:      int(stats.Priority),
+		RelayProtocol: stats.RelayProtocol,
+		URL:           stats.URL,
+	}
+}
+
 func (conn *webRTCConn) recordSelectedICECandidateStats() error {
 	conn.mutex.Lock()
 	defer conn.mutex.Unlock()
@@ -1324,6 +1342,14 @@ func (conn *webRTCConn) recordSelectedICECandidateStats() error {
 			isPrivate
 		conn.iceCandidatePairMetrics["inproxy_webrtc_remote_ice_candidate_port"] =
 			remoteCandidateStats.Port
+
+		// Invoke optional connection established callback with ICE candidate stats
+		if conn.config.OnConnectionEstablished != nil {
+			go conn.config.OnConnectionEstablished(
+				toConnectionStats(localCandidateStats),
+				toConnectionStats(remoteCandidateStats),
+			)
+		}
 
 		foundNominatedPair = true
 		break

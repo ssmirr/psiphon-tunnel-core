@@ -67,6 +67,7 @@ type webRTCConfig struct {
 	UseMediaStreams             bool
 	TrafficShapingParameters    *TrafficShapingParameters
 	ReliableTransport           bool
+	OnConnectionEstablished     func(localCandidate, remoteCandidate ConnectionStats)
 }
 
 func (conn *webRTCConn) SetRemoteSDP(

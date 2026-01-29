@@ -1118,6 +1118,11 @@ type Config struct {
 	deviceBinder    DeviceBinder
 	networkIDGetter *cachingNetworkIDGetter
 
+	// OnInproxyConnectionEstablished is an optional callback that is invoked
+	// when an in-proxy WebRTC connection is successfully established. The
+	// callback receives the selected ICE candidate pair statistics.
+	OnInproxyConnectionEstablished func(localCandidate, remoteCandidate inproxy.ConnectionStats)
+
 	clientFeatures []string
 
 	resolverMutex sync.Mutex

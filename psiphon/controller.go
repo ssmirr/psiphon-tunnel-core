@@ -3132,6 +3132,7 @@ func (controller *Controller) runInproxyProxy() {
 		LimitDownstreamBytesPerSecond: controller.config.InproxyLimitDownstreamBytesPerSecond,
 		MustUpgrade:                   controller.config.OnInproxyMustUpgrade,
 		ActivityUpdater:               activityUpdater,
+		OnConnectionEstablished:       controller.config.OnInproxyConnectionEstablished,
 	}
 
 	proxy, err := inproxy.NewProxy(config)

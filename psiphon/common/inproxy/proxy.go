@@ -73,6 +73,33 @@ type Proxy struct {
 // TODO: add PublicNetworkAddress/ListenNetworkAddress to facilitate manually
 // configured, permanent port mappings.
 
+// ConnectionStats contains information about an established WebRTC connection's
+// ICE candidate. This includes network addressing, transport protocol, and
+// candidate properties.
+type ConnectionStats struct {
+	// IP is the IP address of the candidate (IPv4 or IPv6).
+	IP string
+
+	// Port is the port number of the candidate.
+	Port int
+
+	// Protocol is the transport protocol (typically "udp" or "tcp").
+	Protocol string
+
+	// CandidateType indicates the type of candidate (host, srflx, relay, prflx).
+	CandidateType string
+
+	// Priority is the candidate priority value.
+	Priority int
+
+	// RelayProtocol is the protocol used to communicate with TURN server,
+	// if this is a relayed candidate (udp, tcp, or tls). Empty for non-relay candidates.
+	RelayProtocol string
+
+	// URL is the TURN or STUN server URL that provided this candidate, if applicable.
+	URL string
+}
+
 // ProxyConfig specifies the configuration for a Proxy run.
 type ProxyConfig struct {
 
@@ -149,6 +176,11 @@ type ProxyConfig struct {
 	// ActivityUpdater specifies an ActivityUpdater for activity associated
 	// with this proxy.
 	ActivityUpdater ActivityUpdater
+
+	// OnConnectionEstablished is an optional callback that is invoked when a
+	// WebRTC connection is successfully established. The callback receives
+	// the selected ICE candidate pair statistics.
+	OnConnectionEstablished func(localCandidate, remoteCandidate ConnectionStats)
 }
 
 // ActivityUpdater is a callback that is invoked when clients connect and
@@ -778,7 +810,8 @@ func (p *Proxy) proxyOneClient(
 			// client configures the data channel using
 			// webrtc.DataChannelInit.Ordered, and this configuration is sent
 			// to the proxy in the client's SDP.
-			ReliableTransport: announceResponse.NetworkProtocol == NetworkProtocolTCP,
+			ReliableTransport:       announceResponse.NetworkProtocol == NetworkProtocolTCP,
+			OnConnectionEstablished: p.config.OnConnectionEstablished,
 		},
 		announceResponse.ClientOfferSDP,
 		hasPersonalCompartmentIDs)
