@@ -74,30 +74,21 @@ type Proxy struct {
 // configured, permanent port mappings.
 
 // ConnectionStats contains information about an established WebRTC connection's
-// ICE candidate. This includes network addressing, transport protocol, and
-// candidate properties.
+// ICE candidate pair. These fields correspond to webrtc.ICECandidateStats.
 type ConnectionStats struct {
-	// IP is the IP address of the candidate (IPv4 or IPv6).
-	IP string
-
-	// Port is the port number of the candidate.
-	Port int
-
-	// Protocol is the transport protocol (typically "udp" or "tcp").
-	Protocol string
-
-	// CandidateType indicates the type of candidate (host, srflx, relay, prflx).
+	IP            string
+	Port          int
+	Protocol      string
 	CandidateType string
+	Priority      int
+	RelayProtocol string // Populated only when CandidateType is relay
+	URL           string // Populated only when CandidateType is relay
+}
 
-	// Priority is the candidate priority value.
-	Priority int
-
-	// RelayProtocol is the protocol used to communicate with TURN server,
-	// if this is a relayed candidate (udp, tcp, or tls). Empty for non-relay candidates.
-	RelayProtocol string
-
-	// URL is the TURN or STUN server URL that provided this candidate, if applicable.
-	URL string
+// BandwidthStats contains bandwidth usage for a connection.
+type BandwidthStats struct {
+	BytesUp   int64 // Bytes sent to destination
+	BytesDown int64 // Bytes received from destination
 }
 
 // ProxyConfig specifies the configuration for a Proxy run.
@@ -179,8 +170,13 @@ type ProxyConfig struct {
 
 	// OnConnectionEstablished is an optional callback that is invoked when a
 	// WebRTC connection is successfully established. The callback receives
-	// the selected ICE candidate pair statistics.
+	// stats for both the local and remote ICE candidates.
 	OnConnectionEstablished func(localCandidate, remoteCandidate ConnectionStats)
+
+	// OnConnectionClosed is an optional callback that is invoked when a
+	// WebRTC connection is closed. The callback receives the remote ICE
+	// candidate stats and bandwidth usage statistics.
+	OnConnectionClosed func(remoteCandidate *ConnectionStats, bandwidth *BandwidthStats)
 }
 
 // ActivityUpdater is a callback that is invoked when clients connect and
@@ -978,7 +974,7 @@ func (p *Proxy) proxyOneClient(
 
 	waitGroup := new(sync.WaitGroup)
 	relayErrors := make(chan error, 2)
-	var relayedUp, relayedDown int32
+	var bytesDown, bytesUp int64
 
 	waitGroup.Add(1)
 	go func() {
@@ -1003,7 +999,7 @@ func (p *Proxy) proxyOneClient(
 
 		n, err := io.Copy(webRTCConn, destinationConn)
 		if n > 0 {
-			atomic.StoreInt32(&relayedDown, 1)
+			atomic.AddInt64(&bytesDown, n)
 		}
 		relayErrors <- errors.Trace(err)
 	}()
@@ -1013,7 +1009,7 @@ func (p *Proxy) proxyOneClient(
 		defer waitGroup.Done()
 		n, err := io.Copy(destinationConn, webRTCConn)
 		if n > 0 {
-			atomic.StoreInt32(&relayedUp, 1)
+			atomic.AddInt64(&bytesUp, n)
 		}
 		relayErrors <- errors.Trace(err)
 	}()
@@ -1035,8 +1031,19 @@ func (p *Proxy) proxyOneClient(
 
 	// Don't apply a back-off delay to the next announcement since this
 	// iteration successfully relayed bytes.
-	if atomic.LoadInt32(&relayedUp) == 1 || atomic.LoadInt32(&relayedDown) == 1 {
+	if atomic.LoadInt64(&bytesUp) > 0 || atomic.LoadInt64(&bytesDown) > 0 {
 		backOff = false
+	}
+
+	// Invoke callback with bandwidth stats for this connection
+	if p.config.OnConnectionClosed != nil {
+		stats := webRTCConn.GetConnectionStats()
+		if stats != nil {
+			go p.config.OnConnectionClosed(stats, &BandwidthStats{
+				BytesUp:   atomic.LoadInt64(&bytesUp),
+				BytesDown: atomic.LoadInt64(&bytesDown),
+			})
+		}
 	}
 
 	return backOff, err

@@ -3133,6 +3133,7 @@ func (controller *Controller) runInproxyProxy() {
 		MustUpgrade:                   controller.config.OnInproxyMustUpgrade,
 		ActivityUpdater:               activityUpdater,
 		OnConnectionEstablished:       controller.config.OnInproxyConnectionEstablished,
+		OnConnectionClosed:            controller.config.OnInproxyConnectionClosed,
 	}
 
 	proxy, err := inproxy.NewProxy(config)

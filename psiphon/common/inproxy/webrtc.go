@@ -112,6 +112,7 @@ type webRTCConn struct {
 	receiveMediaTrackOpenedSignal chan struct{}
 	mediaTrackReliabilityLayer    *reliableConn
 	iceCandidatePairMetrics       common.LogFields
+	remoteCandidateStats          *ConnectionStats // Stored for OnConnectionClosed callback
 
 	readMutex               sync.Mutex
 	readBuffer              []byte
@@ -182,6 +183,11 @@ type webRTCConfig struct {
 	// WebRTC connection is successfully established. The callback receives
 	// the selected ICE candidate pair statistics.
 	OnConnectionEstablished func(localCandidate, remoteCandidate ConnectionStats)
+
+	// OnConnectionClosed is an optional callback that is invoked when a
+	// WebRTC connection is closed. The callback receives the remote ICE
+	// candidate stats and bandwidth usage statistics.
+	OnConnectionClosed func(remoteCandidate ConnectionStats, bandwidth BandwidthStats)
 }
 
 // newWebRTCConnWithOffer initiates a new WebRTC connection. An offer SDP is
@@ -1351,6 +1357,10 @@ func (conn *webRTCConn) recordSelectedICECandidateStats() error {
 			)
 		}
 
+		// Store remote candidate stats for OnConnectionClosed callback
+		remoteStats := toConnectionStats(remoteCandidateStats)
+		conn.remoteCandidateStats = &remoteStats
+
 		foundNominatedPair = true
 		break
 	}
@@ -1428,6 +1438,14 @@ func (conn *webRTCConn) Close() error {
 
 func (conn *webRTCConn) IsClosed() bool {
 	return atomic.LoadInt32(&conn.isClosed) == 1
+}
+
+// GetConnectionStats returns the remote candidate stats for this connection,
+// or nil if not yet established.
+func (conn *webRTCConn) GetConnectionStats() *ConnectionStats {
+	conn.mutex.Lock()
+	defer conn.mutex.Unlock()
+	return conn.remoteCandidateStats
 }
 
 func (conn *webRTCConn) Read(p []byte) (int, error) {

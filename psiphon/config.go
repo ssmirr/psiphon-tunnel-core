@@ -1123,6 +1123,11 @@ type Config struct {
 	// callback receives the selected ICE candidate pair statistics.
 	OnInproxyConnectionEstablished func(localCandidate, remoteCandidate inproxy.ConnectionStats)
 
+	// OnInproxyConnectionClosed is an optional callback that is invoked when
+	// an in-proxy WebRTC connection is closed. The callback receives the
+	// remote candidate stats and bandwidth statistics for that connection.
+	OnInproxyConnectionClosed func(remoteCandidate *inproxy.ConnectionStats, bandwidth *inproxy.BandwidthStats)
+
 	clientFeatures []string
 
 	resolverMutex sync.Mutex

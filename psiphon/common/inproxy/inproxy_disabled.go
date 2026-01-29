@@ -68,6 +68,7 @@ type webRTCConfig struct {
 	TrafficShapingParameters    *TrafficShapingParameters
 	ReliableTransport           bool
 	OnConnectionEstablished     func(localCandidate, remoteCandidate ConnectionStats)
+	OnConnectionClosed          func(remoteCandidate *ConnectionStats, bandwidth *BandwidthStats)
 }
 
 func (conn *webRTCConn) SetRemoteSDP(
@@ -87,6 +88,10 @@ func (conn *webRTCConn) Close() error {
 
 func (conn *webRTCConn) IsClosed() bool {
 	return false
+}
+
+func (conn *webRTCConn) GetConnectionStats() *ConnectionStats {
+	return nil
 }
 
 func (conn *webRTCConn) Read(p []byte) (int, error) {
