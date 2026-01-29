@@ -1038,12 +1038,10 @@ func (p *Proxy) proxyOneClient(
 	// Invoke callback with bandwidth stats for this connection
 	if p.config.OnConnectionClosed != nil {
 		stats := webRTCConn.GetConnectionStats()
-		if stats != nil {
-			go p.config.OnConnectionClosed(stats, &BandwidthStats{
-				BytesUp:   atomic.LoadInt64(&bytesUp),
-				BytesDown: atomic.LoadInt64(&bytesDown),
-			})
-		}
+		go p.config.OnConnectionClosed(stats, &BandwidthStats{
+			BytesUp:   atomic.LoadInt64(&bytesUp),
+			BytesDown: atomic.LoadInt64(&bytesDown),
+		})
 	}
 
 	return backOff, err
