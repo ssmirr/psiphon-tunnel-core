@@ -485,6 +485,34 @@ func GetTacticsCapability(protocol string) string {
 	return GetCapability(protocol) + "-TACTICS"
 }
 
+// IsTacticsCapability indicates if the specified capability is a server
+// tactics capability.
+func IsTacticsCapability(protocol string) bool {
+	return strings.HasSuffix(protocol, "-TACTICS")
+}
+
+// GetServerEntryFields converts a ServerEntry to ServerEntryFields.
+//
+// Note that a conversion in this direction doesn't retain unrecognized
+// fields; see ServerEntryFields comment. Clients should only store
+// ServerEntryFields obtained from DecodeServerEntryFields or
+// DecodePackedServerEntryFields.
+func (serverEntry *ServerEntry) GetServerEntryFields() (ServerEntryFields, error) {
+
+	marshaledServerEntry, err := json.Marshal(serverEntry)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	var serverEntryFields ServerEntryFields
+	err = json.Unmarshal(marshaledServerEntry, &serverEntryFields)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	return serverEntryFields, nil
+}
+
 // hasCapability indicates if the server entry has the specified capability.
 //
 // Any internal "PASSTHROUGH-v2 or "PASSTHROUGH" component in the server
@@ -918,6 +946,7 @@ func (serverEntry *ServerEntry) GetSupportedTacticsProtocols() []string {
 		}
 
 		requiredCapability := GetTacticsCapability(protocol)
+
 		if !serverEntry.hasCapability(requiredCapability) {
 			continue
 		}
@@ -942,8 +971,16 @@ func (serverEntry *ServerEntry) HasSignature() bool {
 	return serverEntry.Signature != ""
 }
 
+func (serverEntry *ServerEntry) GetTag() string {
+	if serverEntry.Tag != "" {
+		return serverEntry.Tag
+	}
+	return GenerateServerEntryTag(
+		serverEntry.IpAddress, serverEntry.WebServerSecret)
+}
+
 func (serverEntry *ServerEntry) GetDiagnosticID() string {
-	return TagToDiagnosticID(serverEntry.Tag)
+	return TagToDiagnosticID(serverEntry.GetTag())
 }
 
 // GenerateServerEntryTag creates a server entry tag value that is
@@ -1041,9 +1078,7 @@ func encodeServerEntry(
 // used by remote server lists and Psiphon server handshake requests.
 //
 // The resulting ServerEntry.LocalSource is populated with serverEntrySource,
-// which should be one of SERVER_ENTRY_SOURCE_EMBEDDED, SERVER_ENTRY_SOURCE_REMOTE,
-// SERVER_ENTRY_SOURCE_DISCOVERY, SERVER_ENTRY_SOURCE_TARGET,
-// SERVER_ENTRY_SOURCE_OBFUSCATED.
+// which should be one of SupportedServerEntrySources.
 // ServerEntry.LocalTimestamp is populated with the provided timestamp, which
 // should be a RFC 3339 formatted string. These local fields are stored with the
 // server entry and reported to the server as stats (a coarse granularity timestamp
@@ -1129,7 +1164,7 @@ func ValidateServerEntryFields(serverEntryFields ServerEntryFields) error {
 	// Ensure locally initialized fields have been set.
 
 	source := serverEntryFields.GetLocalSource()
-	if !common.Contains(
+	if !common.ContainsWildcard(
 		SupportedServerEntrySources, source) {
 		return errors.Tracef("server entry has invalid source: %s", source)
 	}

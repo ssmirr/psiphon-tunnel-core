@@ -135,12 +135,14 @@ public class PsiphonTunnel {
          * Called when tunnel-core reports proxy usage statistics.
          * By default onInproxyProxyActivity is disabled. Enable it by setting
          * EmitInproxyProxyActivity to true in the Psiphon config.
+         * @param announcing Number of new clients the proxy is accepting.
          * @param connectingClients Number of clients connecting to the proxy.
          * @param connectedClients Number of clients currently connected to the proxy.
          * @param bytesUp  Bytes uploaded through the proxy since the last report.
          * @param bytesDown Bytes downloaded through the proxy since the last report.
          */
-        default void onInproxyProxyActivity(int connectingClients, int connectedClients,long bytesUp, long bytesDown) {}
+        default void onInproxyProxyActivity(
+            int announcing, int connectingClients, int connectedClients,long bytesUp, long bytesDown) {}
         /**
          * Called when tunnel-core reports connected server region information.
          * @param region The server region received.
@@ -262,6 +264,19 @@ public class PsiphonTunnel {
 
     public boolean importExchangePayload(String payload) {
         return Psi.importExchangePayload(payload);
+    }
+
+    // importPushPayload imports a server entry push payload. If no tunnel is
+    // currently connected, this operation will reset tunnel establishment
+    // with imported server entries prioritized appropriately. The push
+    // payload parameters must be set in the Psiphon config, and Psiphon must
+    // be started.
+    //
+    // Returns true if the import succeeded and false on any error. Error
+    // details are logged to diagnostics. If an import is partially
+    // successful, the imported server entries are retained and prioritized.
+    public boolean importPushPayload(byte[] payload) {
+        return Psi.importPushPayload(payload);
     }
 
     // Writes Go runtime profile information to a set of files in the specifiec output directory.
@@ -923,6 +938,7 @@ public class PsiphonTunnel {
             } else if (noticeType.equals("InproxyProxyActivity")) {
                 JSONObject data = notice.getJSONObject("data");
                 mHostService.onInproxyProxyActivity(
+                        data.getInt("announcing"),
                         data.getInt("connectingClients"),
                         data.getInt("connectedClients"),
                         data.getLong("bytesUp"),

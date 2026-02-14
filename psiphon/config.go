@@ -241,6 +241,19 @@ type Config struct {
 	// recommended.
 	ConnectionWorkerPoolSize int `json:",omitempty"`
 
+	// ConnectionWorkerPoolMaxSize specifies a cap for ConnectionWorkerPoolSize
+	// that will not be exceeded by any tactics setting. This is intended for
+	// use in low memory environments. If omitted or when 0, it has no effect.
+	ConnectionWorkerPoolMaxSize int `json:",omitempty"`
+
+	// DisableConnectionWorkerPool forces ConnectionWorkerPoolSize to 0; this
+	// may be used to load cached tactics or perform an untunneled tactics
+	// request and then post tactics-related notices, including Application
+	// Parameters, without establishing a tunnel. When
+	// DisableConnectionWorkerPool is set, server list bootstrapping remains
+	// enabled.
+	DisableConnectionWorkerPool bool `json:",omitempty"`
+
 	// TunnelPoolSize specifies how many tunnels to run in parallel. Port
 	// forwards are multiplexed over multiple tunnels. If omitted or when 0,
 	// the default is TUNNEL_POOL_SIZE, which is recommended. Any value over
@@ -657,6 +670,38 @@ type Config struct {
 	// transfer rate limit for each proxied client. When 0, there is no limit.
 	InproxyLimitDownstreamBytesPerSecond int `json:",omitempty"`
 
+	// InproxyReducedStartTime specifies the local time of day(HH:MM, 24-hour,
+	// UTC) at which reduced in-proxy settings begin.
+	InproxyReducedStartTime string `json:",omitempty"`
+
+	// InproxyReducedEndTime specifies the local time of day (HH:MM, 24-hour,
+	// UTC) at which reduced in-proxy settings end.
+	InproxyReducedEndTime string `json:",omitempty"`
+
+	// InproxyReducedMaxClients specifies the maximum number of in-proxy
+	// clients to be proxied concurrently during the reduced time range.
+	// When set, must be > 0 and <= InproxyMaxClients.
+	//
+	// Clients connected when the reduced settings begin will not be
+	// disconnected, so InproxyReducedMaxClients is a soft limit.
+	InproxyReducedMaxClients int `json:",omitempty"`
+
+	// InproxyReducedLimitUpstreamBytesPerSecond specifies the upstream byte
+	// transfer rate limit for each proxied client during the reduced time
+	// range. When 0, InproxyLimitUpstreamBytesPerSecond is the limit.
+	//
+	// Rates for clients already connected when the reduced settings begin or
+	// end will not change.
+	InproxyReducedLimitUpstreamBytesPerSecond int `json:",omitempty"`
+
+	// InproxyReducedLimitDownstreamBytesPerSecond specifies the downstream byte
+	// transfer rate limit for each proxied client during the reduced time
+	// range. When 0, InproxyLimitDownstreamBytesPerSecond is the limit.
+	//
+	// Rates for clients already connected when the reduced settings begin or
+	// end will not change.
+	InproxyReducedLimitDownstreamBytesPerSecond int `json:",omitempty"`
+
 	// InproxyProxyPersonalCompartmentID specifies the personal compartment
 	// ID used by an in-proxy proxy. Personal compartment IDs are
 	// distributed from proxy operators to client users out-of-band and
@@ -688,6 +733,21 @@ type Config struct {
 	// diagnostics. Specify 0 to disable. When not specified, the default is
 	// 60 seconds.
 	ShutdownGoroutineProfileDeadlineSeconds *int `json:",omitempty"`
+
+	// DisableDSLFetcher disables DSL fetches. If set, this overrides the
+	// EnableDSLFetcher tactics parameter. This may be used for special case
+	// temporary tunnels.
+	DisableDSLFetcher bool `json:",omitempty"`
+
+	// PushPayloadObfuscationKey is a base64-encoded, secret key value used to
+	// deobfuscate push payloads. This value is supplied by the Psiphon
+	// Network. Required for push payload imports.
+	PushPayloadObfuscationKey string `json:",omitempty"`
+
+	// PushPayloadSignaturePublicKey is a base64-encoded, public key value
+	// used to verify push payloads. This value is supplied by the Psiphon
+	// Network. Required for push payload imports.
+	PushPayloadSignaturePublicKey string `json:",omitempty"`
 
 	//
 	// The following parameters are deprecated.
@@ -835,14 +895,14 @@ type Config struct {
 	LivenessTestMaxDownstreamBytes *int                         `json:",omitempty"`
 
 	// ReplayCandidateCount and other Replay fields are for testing purposes.
-	ReplayCandidateCount                   *int     `json:",omitempty"`
-	ReplayDialParametersTTLSeconds         *int     `json:",omitempty"`
-	ReplayTargetUpstreamBytes              *int     `json:",omitempty"`
-	ReplayTargetDownstreamBytes            *int     `json:",omitempty"`
-	ReplayTargetTunnelDurationSeconds      *int     `json:",omitempty"`
-	ReplayLaterRoundMoveToFrontProbability *float64 `json:",omitempty"`
-	ReplayRetainFailedProbability          *float64 `json:",omitempty"`
-	ReplayIgnoreChangedConfigState         *bool    `json:",omitempty"`
+	ReplayCandidateCount                      *int     `json:",omitempty"`
+	ReplayDialParametersTTLSeconds            *int     `json:",omitempty"`
+	ReplayTargetUpstreamBytes                 *int     `json:",omitempty"`
+	ReplayTargetDownstreamBytes               *int     `json:",omitempty"`
+	ReplayTargetTunnelDurationSeconds         *int     `json:",omitempty"`
+	ReplayLaterRoundMoveToFrontProbability    *float64 `json:",omitempty"`
+	ReplayRetainFailedProbability             *float64 `json:",omitempty"`
+	ReplayIgnoreChangedConfigStateProbability *float64 `json:",omitempty"`
 
 	// NetworkLatencyMultiplierMin and other NetworkLatencyMultiplier fields are
 	// for testing purposes.
@@ -864,9 +924,6 @@ type Config struct {
 	ClientBurstUpstreamDeadlineMilliseconds   *int `json:",omitempty"`
 	ClientBurstDownstreamTargetBytes          *int `json:",omitempty"`
 	ClientBurstDownstreamDeadlineMilliseconds *int `json:",omitempty"`
-
-	// ApplicationParameters is for testing purposes.
-	ApplicationParameters parameters.KeyValues `json:",omitempty"`
 
 	// CustomHostNameRegexes and other custom host name fields are for testing
 	// purposes.
@@ -1101,6 +1158,17 @@ type Config struct {
 
 	NetworkIDCacheTTLMilliseconds *int `json:",omitempty"`
 
+	CompressTactics *bool `json:",omitempty"`
+
+	EnableDSLFetcher                                *bool    `json:",omitempty"`
+	DSLPrioritizeDialNewServerEntryProbability      *float64 `json:",omitempty"`
+	DSLPrioritizeDialExistingServerEntryProbability *float64 `json:",omitempty"`
+	DSLPrioritizeDialRetainFailedProbability        *float64 `json:",omitempty"`
+	DSLPrioritizeDialPlaceholderTTLSeconds          *int     `json:",omitempty"`
+
+	ServerEntryIteratorMaxMoveToFront   *int     `json:",omitempty"`
+	ServerEntryIteratorResetProbability *float64 `json:",omitempty"`
+
 	// params is the active parameters.Parameters with defaults, config values,
 	// and, optionally, tactics applied.
 	//
@@ -1143,6 +1211,8 @@ type Config struct {
 	signalComponentFailure atomic.Value
 
 	inproxyMustUpgradePosted int32
+
+	serverEntryIterationMetricsUpdater atomic.Value
 }
 
 // TacticsAppliedReceiver specifies the interface for a component that is
@@ -1185,6 +1255,7 @@ func LoadConfig(configJson []byte) (*Config, error) {
 		common.GetCurrentTimestamp())
 
 	config.signalComponentFailure.Store(func() {})
+	config.serverEntryIterationMetricsUpdater.Store(func(int) {})
 
 	return &config, nil
 }
@@ -1476,8 +1547,46 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 		return errors.TraceNew("invalid ObfuscatedSSHAlgorithms")
 	}
 
-	if config.InproxyEnableProxy && config.InproxyMaxClients <= 0 {
-		return errors.TraceNew("invalid InproxyMaxClients")
+	if config.InproxyEnableProxy {
+
+		if config.InproxyMaxClients <= 0 {
+			return errors.TraceNew("invalid InproxyMaxClients")
+		}
+
+		if config.InproxyReducedStartTime != "" ||
+			config.InproxyReducedEndTime != "" ||
+			config.InproxyReducedMaxClients > 0 {
+
+			startMinute, err := common.ParseTimeOfDayMinutes(config.InproxyReducedStartTime)
+			if err != nil {
+				return errors.Tracef("invalid InproxyReducedStartTime: %v", err)
+			}
+
+			endMinute, err := common.ParseTimeOfDayMinutes(config.InproxyReducedEndTime)
+			if err != nil {
+				return errors.Tracef("invalid InproxyReducedEndTime: %v", err)
+			}
+
+			// Reduced all day is not a valid configuration.
+			if startMinute == endMinute {
+				return errors.TraceNew("invalid InproxyReducedStartTime/InproxyReducedEndTime")
+			}
+
+			if config.InproxyReducedMaxClients <= 0 ||
+				config.InproxyReducedMaxClients > config.InproxyMaxClients {
+				return errors.TraceNew("invalid InproxyReducedMaxClients")
+			}
+
+			// InproxyReducedLimitUpstream/DownstreamBytesPerSecond don't necessarily
+			// need to be less than InproxyLimitUpstream/DownstreamBytesPerSecond.
+
+			if config.InproxyReducedLimitUpstreamBytesPerSecond == 0 {
+				config.InproxyReducedLimitUpstreamBytesPerSecond = config.InproxyLimitUpstreamBytesPerSecond
+			}
+			if config.InproxyReducedLimitDownstreamBytesPerSecond == 0 {
+				config.InproxyReducedLimitDownstreamBytesPerSecond = config.InproxyLimitDownstreamBytesPerSecond
+			}
+		}
 	}
 
 	if !config.DisableTunnels &&
@@ -1536,8 +1645,8 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 		return errors.Trace(err)
 	}
 
-	// parametersParameters.Set will validate the config fields applied to
-	// parametersParameters.
+	// parameters.Parameters.Set will validate the config fields applied to
+	// parameters.Parameters.
 
 	err = config.SetParameters("", false, nil)
 	if err != nil {
@@ -1691,7 +1800,8 @@ func (config *Config) GetParameters() *parameters.Parameters {
 //
 // If there is an error, the existing Config.parameters are left
 // entirely unmodified.
-func (config *Config) SetParameters(tag string, skipOnError bool, applyParameters map[string]interface{}) error {
+func (config *Config) SetParameters(
+	tag string, skipOnError bool, applyParameters map[string]interface{}) error {
 
 	setParameters := []map[string]interface{}{config.makeConfigParameters()}
 	if applyParameters != nil {
@@ -1743,12 +1853,12 @@ func (config *Config) SetParameters(tag string, skipOnError bool, applyParameter
 	// Application Parameters are feature flags/config info, delivered as Client
 	// Parameters via tactics/etc., to be communicated to the outer application.
 	// Emit these now, as notices.
-	if p.WeightedCoinFlip(parameters.ApplicationParametersProbability) {
+	//
+	// Only emit when tactics are received (applyParameters != nil), to avoid
+	// triggering the outer application with empty Application Parameters via
+	// the SetParameters call from Commit.
+	if applyParameters != nil {
 		NoticeApplicationParameters(p.KeyValues(parameters.ApplicationParameters))
-	} else {
-		// The front end may persist Application Parameters, so clear any previously
-		// persisted values.
-		NoticeApplicationParameters(parameters.KeyValues{})
 	}
 
 	// Signal all registered TacticsAppliedReceivers that new tactics have
@@ -1931,6 +2041,20 @@ func (config *Config) OnInproxyMustUpgrade() {
 		}
 		config.signalComponentFailure.Load().(func())()
 	}
+}
+
+func (config *Config) SetServerEntryIterationMetricsUpdater(
+	updater func(movedToFront int)) {
+
+	config.serverEntryIterationMetricsUpdater.Store(updater)
+}
+
+func (config *Config) GetServerEntryIterationMetricsUpdater() func(movedToFront int) {
+	updater := config.serverEntryIterationMetricsUpdater.Load()
+	if updater != nil {
+		return updater.(func(int))
+	}
+	return nil
 }
 
 func (config *Config) makeConfigParameters() map[string]interface{} {
@@ -2188,8 +2312,8 @@ func (config *Config) makeConfigParameters() map[string]interface{} {
 		applyParameters[parameters.ReplayRetainFailedProbability] = *config.ReplayRetainFailedProbability
 	}
 
-	if config.ReplayIgnoreChangedConfigState != nil {
-		applyParameters[parameters.ReplayIgnoreChangedConfigState] = *config.ReplayIgnoreChangedConfigState
+	if config.ReplayIgnoreChangedConfigStateProbability != nil {
+		applyParameters[parameters.ReplayIgnoreChangedConfigStateProbability] = *config.ReplayIgnoreChangedConfigStateProbability
 	}
 
 	if config.UseOnlyCustomTLSProfiles != nil {
@@ -2226,10 +2350,6 @@ func (config *Config) makeConfigParameters() map[string]interface{} {
 
 	if config.ClientBurstDownstreamDeadlineMilliseconds != nil {
 		applyParameters[parameters.ClientBurstDownstreamDeadline] = fmt.Sprintf("%dms", *config.ClientBurstDownstreamDeadlineMilliseconds)
-	}
-
-	if config.ApplicationParameters != nil {
-		applyParameters[parameters.ApplicationParameters] = config.ApplicationParameters
 	}
 
 	if config.CustomHostNameRegexes != nil {
@@ -2898,6 +3018,38 @@ func (config *Config) makeConfigParameters() map[string]interface{} {
 
 	if config.NetworkIDCacheTTLMilliseconds != nil {
 		applyParameters[parameters.NetworkIDCacheTTL] = fmt.Sprintf("%dms", *config.NetworkIDCacheTTLMilliseconds)
+	}
+
+	if config.CompressTactics != nil {
+		applyParameters[parameters.CompressTactics] = *config.CompressTactics
+	}
+
+	if config.EnableDSLFetcher != nil {
+		applyParameters[parameters.EnableDSLFetcher] = *config.EnableDSLFetcher
+	}
+
+	if config.DSLPrioritizeDialNewServerEntryProbability != nil {
+		applyParameters[parameters.DSLPrioritizeDialNewServerEntryProbability] = *config.DSLPrioritizeDialNewServerEntryProbability
+	}
+
+	if config.DSLPrioritizeDialExistingServerEntryProbability != nil {
+		applyParameters[parameters.DSLPrioritizeDialExistingServerEntryProbability] = *config.DSLPrioritizeDialExistingServerEntryProbability
+	}
+
+	if config.DSLPrioritizeDialRetainFailedProbability != nil {
+		applyParameters[parameters.DSLPrioritizeDialRetainFailedProbability] = *config.DSLPrioritizeDialRetainFailedProbability
+	}
+
+	if config.DSLPrioritizeDialPlaceholderTTLSeconds != nil {
+		applyParameters[parameters.DSLPrioritizeDialPlaceholderTTL] = fmt.Sprintf("%ds", *config.DSLPrioritizeDialPlaceholderTTLSeconds)
+	}
+
+	if config.ServerEntryIteratorMaxMoveToFront != nil {
+		applyParameters[parameters.ServerEntryIteratorResetProbability] = *config.ServerEntryIteratorResetProbability
+	}
+
+	if config.EnableDSLFetcher != nil {
+		applyParameters[parameters.EnableDSLFetcher] = *config.EnableDSLFetcher
 	}
 
 	// When adding new config dial parameters that may override tactics, also

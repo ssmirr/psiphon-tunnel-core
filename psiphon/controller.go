@@ -42,11 +42,14 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/push"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/resolver"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tactics"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tun"
 	utls "github.com/Psiphon-Labs/utls"
+	"github.com/axiomhq/hyperloglog"
 	lrucache "github.com/cognusion/go-cache-lru"
+	"github.com/fxamacker/cbor/v2"
 	"golang.org/x/time/rate"
 )
 
@@ -84,6 +87,8 @@ type Controller struct {
 	untunneledSplitTunnelClassifications    *lrucache.Cache
 	signalFetchCommonRemoteServerList       chan struct{}
 	signalFetchObfuscatedServerLists        chan struct{}
+	signalUntunneledDSLFetch                chan struct{}
+	signalTunneledDSLFetch                  chan struct{}
 	signalDownloadUpgrade                   chan string
 	signalReportServerEntries               chan *serverEntriesReportRequest
 	signalReportConnected                   chan struct{}
@@ -103,6 +108,11 @@ type Controller struct {
 	inproxyLastStoredTactics                time.Time
 	establishSignalForceTacticsFetch        chan struct{}
 	inproxyClientDialRateLimiter            *rate.Limiter
+
+	serverEntryIterationMetricsMutex                    sync.Mutex
+	serverEntryIterationUniqueCandidates                *hyperloglog.Sketch
+	serverEntryIterationFirstFrontedMeekCandidateNumber int
+	serverEntryIterationMovedToFrontCount               int
 
 	currentNetworkMutex      sync.Mutex
 	currentNetworkCtx        context.Context
@@ -163,6 +173,8 @@ func NewController(config *Config) (controller *Controller, err error) {
 		// establish will eventually signal another fetch remote.
 		signalFetchCommonRemoteServerList: make(chan struct{}),
 		signalFetchObfuscatedServerLists:  make(chan struct{}),
+		signalUntunneledDSLFetch:          make(chan struct{}),
+		signalTunneledDSLFetch:            make(chan struct{}),
 		signalDownloadUpgrade:             make(chan string),
 		signalReportConnected:             make(chan struct{}),
 
@@ -288,6 +300,7 @@ func NewController(config *Config) (controller *Controller, err error) {
 
 	controller.config.SetTacticsAppliedReceivers(tacticAppliedReceivers)
 	controller.config.SetSignalComponentFailure(controller.SignalComponentFailure)
+	controller.config.SetServerEntryIterationMetricsUpdater(controller.updateServerEntryIterationResetMetrics)
 
 	return controller, nil
 }
@@ -415,6 +428,29 @@ func (controller *Controller) Run(ctx context.Context) {
 				FetchObfuscatedServerLists,
 				controller.signalFetchObfuscatedServerLists)
 		}
+	}
+
+	if !controller.config.DisableDSLFetcher {
+
+		controller.runWaitGroup.Add(1)
+		go func() {
+			defer controller.runWaitGroup.Done()
+			runUntunneledDSLFetcher(
+				controller.runCtx,
+				controller.config,
+				controller.inproxyClientBrokerClientManager,
+				controller.signalUntunneledDSLFetch)
+		}()
+
+		controller.runWaitGroup.Add(1)
+		go func() {
+			defer controller.runWaitGroup.Done()
+			runTunneledDSLFetcher(
+				controller.runCtx,
+				controller.config,
+				controller.getNextActiveTunnel,
+				controller.signalTunneledDSLFetch)
+		}()
 	}
 
 	if controller.config.InproxyEnableProxy {
@@ -552,7 +588,7 @@ func (controller *Controller) ExportExchangePayload() string {
 // See the comment for psiphon.ImportExchangePayload for more details about
 // the import.
 //
-// When the import is successful, a signal is set to trigger a restart any
+// When the import is successful, a signal is set to trigger a restart of any
 // establishment in progress. This will cause the newly imported server entry
 // to be prioritized, which it otherwise would not be in later establishment
 // rounds. The establishment process continues after ImportExchangePayload
@@ -578,6 +614,58 @@ func (controller *Controller) ImportExchangePayload(payload string) bool {
 	}
 
 	return true
+}
+
+// ImportPushPayload imports a server entry push payload.
+//
+// When the import is successful, a signal is set to trigger a restart of any
+// establishment in progress. This will cause imported server entries to be
+// prioritized as indicated in the payload. The establishment process
+// continues after ImportPushPayload returns.
+//
+// If the client already has a connected tunnel, or a tunnel connection is
+// established concurrently with the import, the signal has no effect as the
+// overall goal is establish _any_ connection.
+func (controller *Controller) ImportPushPayload(payload []byte) bool {
+
+	importer := func(
+		packedServerEntryFields protocol.PackedServerEntryFields,
+		source string,
+		prioritizeDial bool) error {
+
+		err := DSLStoreServerEntry(
+			controller.config.ServerEntrySignaturePublicKey,
+			packedServerEntryFields,
+			protocol.PushServerEntrySource(source),
+			prioritizeDial,
+			controller.config.GetNetworkID())
+		if err != nil {
+			return errors.Trace(err)
+		}
+
+		return nil
+	}
+
+	n, err := push.ImportPushPayload(
+		controller.config.PushPayloadObfuscationKey,
+		controller.config.PushPayloadSignaturePublicKey,
+		payload,
+		importer)
+
+	if err != nil {
+		NoticeWarning("push payload: %d imported, %v", n, err)
+	} else {
+		NoticeInfo("push payload: %d imported", n)
+	}
+
+	if n > 0 {
+		select {
+		case controller.signalRestartEstablishing <- struct{}{}:
+		default:
+		}
+	}
+
+	return err == nil
 }
 
 // remoteServerListFetcher fetches an out-of-band list of server entries
@@ -1152,6 +1240,15 @@ loop:
 				// tunnel is established.
 				controller.signalConnectedReporter()
 
+				// Signal a tunneled DSL fetch. The tunneled fetch is similar
+				// to the handshake API discovery mechanism:
+				// opportunistically distribute a small number of new server
+				// entries to clients that are already able to connect.
+				select {
+				case controller.signalTunneledDSLFetch <- struct{}{}:
+				default:
+				}
+
 				// If the handshake indicated that a new client version is available,
 				// trigger an upgrade download.
 				// Note: serverContext is nil when DisableApi is set
@@ -1217,6 +1314,20 @@ func (controller *Controller) SignalSeededNewSLOK() {
 	case controller.signalFetchObfuscatedServerLists <- struct{}{}:
 	default:
 	}
+
+	// Reset any delay for the next tunneled DSL request. The next time a
+	// tunnel connects, the DSL request will launch, and the fetcher will
+	// attempt to reassemble OSLs, now with this new SLOK.
+	//
+	// The delay for the next untunneled DSL request is not reset since that
+	// request typically fetches many more server entries, which is more
+	// appropriate for when a client is unable to connect. Receiving a new
+	// SLOK implies the client is currently connected and is likely to
+	// reconnect again and arrive at the tunneled DSL request.
+	//
+	// TODO: launch an immediate tunneled DSL request?
+
+	_ = DSLSetLastTunneledFetchTime(time.Time{})
 }
 
 // SignalTunnelFailure implements the TunnelOwner interface. This function
@@ -1538,10 +1649,10 @@ func (controller *Controller) DirectDial(remoteAddr string) (conn net.Conn, err 
 	return DialTCP(controller.runCtx, remoteAddr, controller.untunneledDialConfig)
 }
 
-// triggerFetches signals RSL, OSL, and upgrade download fetchers to begin, if
-// not already running. triggerFetches is called when tunnel establishment
-// fails to complete within a deadline and in other cases where local
-// circumvention capabilities are lacking and we may require new server
+// triggerFetches signals RSL, OSL, DSL, and upgrade download fetchers to
+// begin, if not already running. triggerFetches is called when tunnel
+// establishment fails to complete within a deadline and in other cases where
+// local circumvention capabilities are lacking and we may require new server
 // entries or client versions with new capabilities.
 func (controller *Controller) triggerFetches() {
 
@@ -1557,11 +1668,19 @@ func (controller *Controller) triggerFetches() {
 	default:
 	}
 
-	// Trigger an OSL fetch in parallel. Both fetches are run in parallel
-	// so that if one out of the common RLS and OSL set is large, it doesn't
-	// doesn't entirely block fetching the other.
+	// Trigger an OSL fetch in parallel. Server list fetches are run in
+	// parallel so that if one fetch is large or slow, it doesn't doesn't
+	// entirely block fetching the others.
 	select {
 	case controller.signalFetchObfuscatedServerLists <- struct{}{}:
+	default:
+	}
+
+	// Trigger the untunneled DSL fetch. The untunneled DSL fetch is similar
+	// to the classic RSL and OSL fetches in that it will attempt to download
+	// a larger, diverse selection of servers.
+	select {
+	case controller.signalUntunneledDSLFetch <- struct{}{}:
 	default:
 	}
 
@@ -2054,27 +2173,10 @@ func (controller *Controller) launchEstablishing() {
 	controller.establishInproxyForceSelectionCount =
 		p.Int(parameters.InproxyTunnelProtocolForceSelectionCount)
 
-	// ConnectionWorkerPoolSize may be set by tactics.
-	//
-	// In-proxy personal pairing mode uses a distinct parameter which is
-	// typically configured to a lower number, limiting concurrent load and
-	// announcement consumption for personal proxies.
+	// workerPoolSize is the number of concurrent establishTunnelWorkers, each
+	// dialing tunnels.
 
-	var workerPoolSize int
-	if controller.config.IsInproxyClientPersonalPairingMode() {
-		workerPoolSize = p.Int(parameters.InproxyPersonalPairingConnectionWorkerPoolSize)
-	} else {
-		workerPoolSize = p.Int(parameters.ConnectionWorkerPoolSize)
-	}
-
-	// When TargetServerEntry is used, override any worker pool size config or
-	// tactic parameter and use a pool size of 1. The typical use case for
-	// TargetServerEntry is to test a specific server with a single connection
-	// attempt. Furthermore, too many concurrent attempts to connect to the
-	// same server will trigger rate limiting.
-	if controller.config.TargetServerEntry != "" {
-		workerPoolSize = 1
-	}
+	workerPoolSize := controller.getConnectionWorkerPoolSize(p)
 
 	// TunnelPoolSize may be set by tactics, subject to local constraints. A pool
 	// size of one is forced in packet tunnel mode or when using a
@@ -2151,6 +2253,8 @@ func (controller *Controller) launchEstablishing() {
 		controller.doConstraintsScan()
 	}
 
+	controller.resetServerEntryIterationMetrics()
+
 	for i := 0; i < workerPoolSize; i++ {
 		controller.establishWaitGroup.Add(1)
 		go controller.establishTunnelWorker()
@@ -2158,6 +2262,49 @@ func (controller *Controller) launchEstablishing() {
 
 	controller.establishWaitGroup.Add(1)
 	go controller.establishCandidateGenerator()
+}
+
+func (controller *Controller) getConnectionWorkerPoolSize(
+	p parameters.ParametersAccessor) int {
+
+	// ConnectionWorkerPoolSize may be set by tactics.
+	//
+	// In-proxy personal pairing mode uses a distinct parameter which is
+	// typically configured to a lower number, limiting concurrent load and
+	// announcement consumption for personal proxies.
+	//
+	// ConnectionWorkerPoolMaxSize is a config-only cap on the worker pool
+	// size which may be set in low memory environments.
+
+	var workerPoolSize int
+	if controller.config.IsInproxyClientPersonalPairingMode() {
+		workerPoolSize = p.Int(parameters.InproxyPersonalPairingConnectionWorkerPoolSize)
+	} else {
+		workerPoolSize = p.Int(parameters.ConnectionWorkerPoolSize)
+	}
+
+	if controller.config.ConnectionWorkerPoolMaxSize > 0 &&
+		workerPoolSize > controller.config.ConnectionWorkerPoolMaxSize {
+
+		workerPoolSize = controller.config.ConnectionWorkerPoolMaxSize
+	}
+
+	// When TargetServerEntry is used, override any worker pool size config or
+	// tactic parameter and use a pool size of 1. The typical use case for
+	// TargetServerEntry is to test a specific server with a single connection
+	// attempt. Furthermore, too many concurrent attempts to connect to the
+	// same server will trigger rate limiting.
+	if controller.config.TargetServerEntry != "" {
+		workerPoolSize = 1
+	}
+
+	// When DisableConnectionWorkerPool is set, no tunnel establishment
+	// workers are run. See Config.DisableConnectionWorkerPool.
+	if controller.config.DisableConnectionWorkerPool {
+		workerPoolSize = 0
+	}
+
+	return workerPoolSize
 }
 
 func (controller *Controller) doConstraintsScan() {
@@ -2308,6 +2455,50 @@ func (controller *Controller) stopEstablishing() {
 	emitDNSMetrics(controller.resolver)
 }
 
+func (controller *Controller) resetServerEntryIterationMetrics() {
+	controller.serverEntryIterationMetricsMutex.Lock()
+	defer controller.serverEntryIterationMetricsMutex.Unlock()
+
+	controller.serverEntryIterationUniqueCandidates = hyperloglog.New()
+	controller.serverEntryIterationFirstFrontedMeekCandidateNumber = -1
+	controller.serverEntryIterationMovedToFrontCount = 0
+}
+
+func (controller *Controller) updateServerEntryIterationDialMetrics(dialParams *DialParameters) {
+	controller.serverEntryIterationMetricsMutex.Lock()
+	defer controller.serverEntryIterationMetricsMutex.Unlock()
+
+	// Unique candidate counting track the number of different server entries
+	// attempted. To avoid the memory overhead of a large map, we use a
+	// probabilistic HyperLogLog with a fixed overhead of 16KB. As a result,
+	// the count is an estimate with on the order of ~1% relative error.
+
+	controller.serverEntryIterationUniqueCandidates.Insert([]byte(dialParams.ServerEntry.IpAddress))
+
+	if controller.serverEntryIterationFirstFrontedMeekCandidateNumber == -1 &&
+		protocol.TunnelProtocolUsesFrontedMeek(dialParams.TunnelProtocol) {
+		controller.serverEntryIterationFirstFrontedMeekCandidateNumber = dialParams.CandidateNumber
+	}
+
+	// Capture a snapshot of server entry iteration metrics to be recorded
+	// with the server_tunnel or failed_tunnel for this candidate.
+	//
+	// See rounding comment in GetLastServerEntryCount.
+
+	estimate := roundServerEntryCount(int(controller.serverEntryIterationUniqueCandidates.Estimate()))
+
+	dialParams.ServerEntryIterationUniqueCandidateEstimate = estimate
+	dialParams.ServerEntryIterationMovedToFrontCount = controller.serverEntryIterationMovedToFrontCount
+	dialParams.ServerEntryIterationFirstFrontedMeekCandidate = controller.serverEntryIterationFirstFrontedMeekCandidateNumber
+}
+
+func (controller *Controller) updateServerEntryIterationResetMetrics(movedToFront int) {
+	controller.serverEntryIterationMetricsMutex.Lock()
+	defer controller.serverEntryIterationMetricsMutex.Unlock()
+
+	controller.serverEntryIterationMovedToFrontCount += movedToFront
+}
+
 // establishCandidateGenerator populates the candidate queue with server entries
 // from the data store. Server entries are iterated in rank order, so that promoted
 // servers with higher rank are priority candidates.
@@ -2364,6 +2555,8 @@ loop:
 		// establishing loop. Clients typically re-establish often enough that we
 		// will see the effect of the remote server list fetch in diagnostics.
 
+		completedServerEntryIteration := false
+
 		roundStartTime := time.Now()
 		var roundNetworkWaitDuration time.Duration
 
@@ -2395,6 +2588,7 @@ loop:
 			if serverEntry == nil {
 				// Completed this iteration
 				NoticeInfo("completed server entry iteration")
+				completedServerEntryIteration = true
 				break
 			}
 
@@ -2460,9 +2654,6 @@ loop:
 			}
 		}
 
-		// Free up resources now, but don't reset until after the pause.
-		iterator.Close()
-
 		// Trigger RSL, OSL, and upgrade checks after failing to establish a
 		// tunnel within parameters.EstablishTunnelWorkTime, or if there are
 		// no server entries present.
@@ -2527,16 +2718,49 @@ loop:
 			}
 		}
 
-		// After a complete iteration of candidate servers, pause before iterating again.
-		// This helps avoid some busy wait loop conditions, and also allows some time for
-		// network conditions to change. Also allows for fetch remote to complete,
-		// in typical conditions (it isn't strictly necessary to wait for this, there will
-		// be more rounds if required).
+		// If the round ended without exhausting the server entry iterator,
+		// decide whether to keep iterating in order, or to perform a reset.
+		// Resets perform a new random shuffle, move replay and prioritized
+		// dial server entries to the front, and incorporate any newly
+		// download server entries.
 
 		p := controller.config.GetParameters().Get()
+
+		resetIterator := completedServerEntryIteration ||
+			p.WeightedCoinFlip(parameters.ServerEntryIteratorResetProbability)
+
+		if resetIterator {
+			// Free up resources now, but don't reset until after the pause.
+			iterator.Close()
+		}
+
+		// After a round, pause before iterating again. This helps avoid some
+		// busy wait loop conditions, and also allows some time for network
+		// conditions to change. Also allows for fetch remote to complete, in
+		// typical conditions (it isn't strictly necessary to wait for this,
+		// there will be more rounds if required).
+
+		pausePeriod := p.Duration(parameters.EstablishTunnelPausePeriod)
+		if controller.config.TargetServerEntry == "" &&
+			GetLastServerEntryCount() == 0 &&
+			((!controller.config.DisableRemoteServerListFetcher &&
+				(controller.config.RemoteServerListURLs != nil ||
+					controller.config.ObfuscatedServerListRootURLs != nil)) ||
+				!controller.config.DisableDSLFetcher) {
+
+			// Reduce/alter the wait time if the client has no server entries
+			// and at least one type of server list fetch is configured.
+			//
+			// As a future enhancement, check for an in-flight server list fetch,
+			// and stop waiting as soon as it's finished.
+
+			pausePeriod = p.Duration(parameters.EstablishTunnelNoServersPausePeriod)
+		}
+
 		timeout := prng.JitterDuration(
-			p.Duration(parameters.EstablishTunnelPausePeriod),
+			pausePeriod,
 			p.Float(parameters.EstablishTunnelPausePeriodJitter))
+
 		p.Close()
 
 		timer := time.NewTimer(timeout)
@@ -2549,11 +2773,13 @@ loop:
 		}
 		timer.Stop()
 
-		err := iterator.Reset()
-		if err != nil {
-			NoticeError("failed to reset iterator: %v", errors.Trace(err))
-			controller.SignalComponentFailure()
-			return
+		if resetIterator {
+			err := iterator.Reset()
+			if err != nil {
+				NoticeError("failed to reset iterator: %v", errors.Trace(err))
+				controller.SignalComponentFailure()
+				return
+			}
 		}
 	}
 }
@@ -2615,7 +2841,7 @@ loop:
 			// broken, the error should persist and eventually get posted.
 
 			p := controller.config.GetParameters().Get()
-			workerPoolSize := p.Int(parameters.ConnectionWorkerPoolSize)
+			workerPoolSize := controller.getConnectionWorkerPoolSize(p)
 			minWaitDuration := p.Duration(parameters.UpstreamProxyErrorMinWaitDuration)
 			maxWaitDuration := p.Duration(parameters.UpstreamProxyErrorMaxWaitDuration)
 			p.Close()
@@ -2873,6 +3099,12 @@ loop:
 			common.SleepWithContext(controller.establishCtx, dialRateLimitDelay)
 		}
 
+		// Now that this candidate will be dialed, update the server entry
+		// iteration metrics to reflect this dial. This call also populates
+		// dialParams with a snapshot of the current iteration metrics.
+
+		controller.updateServerEntryIterationDialMetrics(dialParams)
+
 		// ConnectTunnel will allocate significant memory, so first attempt to
 		// reclaim as much as possible.
 		DoGarbageCollection()
@@ -3065,10 +3297,12 @@ func (controller *Controller) runInproxyProxy() {
 	debugLogging := controller.config.InproxyEnableWebRTCDebugLogging
 
 	var lastActivityNotice time.Time
+	var lastAnnouncing int32
 	var lastActivityConnectingClients, lastActivityConnectedClients int32
 	var lastActivityConnectingClientsTotal, lastActivityConnectedClientsTotal int32
 	var activityTotalBytesUp, activityTotalBytesDown int64
 	activityUpdater := func(
+		announcing int32,
 		connectingClients int32,
 		connectedClients int32,
 		bytesUp int64,
@@ -3085,13 +3319,15 @@ func (controller *Controller) runInproxyProxy() {
 		// activity display.
 
 		if controller.config.EmitInproxyProxyActivity &&
-			(bytesUp > 0 || bytesDown > 0) ||
-			connectingClients != lastActivityConnectingClients ||
-			connectedClients != lastActivityConnectedClients {
+			(bytesUp > 0 || bytesDown > 0 ||
+				announcing != lastAnnouncing ||
+				connectingClients != lastActivityConnectingClients ||
+				connectedClients != lastActivityConnectedClients) {
 
 			NoticeInproxyProxyActivity(
-				connectingClients, connectedClients, bytesUp, bytesDown)
+				announcing, connectingClients, connectedClients, bytesUp, bytesDown)
 
+			lastAnnouncing = announcing
 			lastActivityConnectingClients = connectingClients
 			lastActivityConnectedClients = connectedClients
 		}
@@ -3103,13 +3339,17 @@ func (controller *Controller) runInproxyProxy() {
 		// transferred since starting; in addition to the current number of
 		// connecting and connected clients, whenever that changes. This
 		// notice is for diagnostics.
+		//
+		// Changes in announcing count are frequent and don't trigger
+		// InproxyProxyTotalActivity; the current announcing count is
+		// recorded as a snapshot.
 
 		if lastActivityNotice.Add(activityNoticePeriod).Before(time.Now()) ||
 			connectingClients != lastActivityConnectingClientsTotal ||
 			connectedClients != lastActivityConnectedClientsTotal {
 
 			NoticeInproxyProxyTotalActivity(
-				connectingClients, connectedClients,
+				announcing, connectingClients, connectedClients,
 				activityTotalBytesUp, activityTotalBytesDown)
 			lastActivityNotice = time.Now()
 
@@ -3119,21 +3359,26 @@ func (controller *Controller) runInproxyProxy() {
 	}
 
 	config := &inproxy.ProxyConfig{
-		Logger:                        NoticeCommonLogger(debugLogging),
-		EnableWebRTCDebugLogging:      debugLogging,
-		WaitForNetworkConnectivity:    controller.inproxyWaitForNetworkConnectivity,
-		GetCurrentNetworkContext:      controller.getCurrentNetworkContext,
-		GetBrokerClient:               controller.inproxyGetProxyBrokerClient,
-		GetBaseAPIParameters:          controller.inproxyGetProxyAPIParameters,
-		MakeWebRTCDialCoordinator:     controller.inproxyMakeProxyWebRTCDialCoordinator,
-		HandleTacticsPayload:          controller.inproxyHandleProxyTacticsPayload,
-		MaxClients:                    controller.config.InproxyMaxClients,
-		LimitUpstreamBytesPerSecond:   controller.config.InproxyLimitUpstreamBytesPerSecond,
-		LimitDownstreamBytesPerSecond: controller.config.InproxyLimitDownstreamBytesPerSecond,
-		MustUpgrade:                   controller.config.OnInproxyMustUpgrade,
-		ActivityUpdater:               activityUpdater,
-		OnConnectionEstablished:       controller.config.OnInproxyConnectionEstablished,
-		OnConnectionClosed:            controller.config.OnInproxyConnectionClosed,
+		Logger:                               NoticeCommonLogger(debugLogging),
+		EnableWebRTCDebugLogging:             debugLogging,
+		WaitForNetworkConnectivity:           controller.inproxyWaitForNetworkConnectivity,
+		GetCurrentNetworkContext:             controller.getCurrentNetworkContext,
+		GetBrokerClient:                      controller.inproxyGetProxyBrokerClient,
+		GetBaseAPIParameters:                 controller.inproxyGetProxyAPIParameters,
+		MakeWebRTCDialCoordinator:            controller.inproxyMakeProxyWebRTCDialCoordinator,
+		HandleTacticsPayload:                 controller.inproxyHandleProxyTacticsPayload,
+		MaxClients:                           controller.config.InproxyMaxClients,
+		LimitUpstreamBytesPerSecond:          controller.config.InproxyLimitUpstreamBytesPerSecond,
+		LimitDownstreamBytesPerSecond:        controller.config.InproxyLimitDownstreamBytesPerSecond,
+		ReducedStartTime:                     controller.config.InproxyReducedStartTime,
+		ReducedEndTime:                       controller.config.InproxyReducedEndTime,
+		ReducedMaxClients:                    controller.config.InproxyReducedMaxClients,
+		ReducedLimitUpstreamBytesPerSecond:   controller.config.InproxyReducedLimitUpstreamBytesPerSecond,
+		ReducedLimitDownstreamBytesPerSecond: controller.config.InproxyReducedLimitDownstreamBytesPerSecond,
+		MustUpgrade:                          controller.config.OnInproxyMustUpgrade,
+		ActivityUpdater:                      activityUpdater,
+		OnConnectionEstablished:              controller.config.OnInproxyConnectionEstablished,
+		OnConnectionClosed:                   controller.config.OnInproxyConnectionClosed,
 	}
 
 	proxy, err := inproxy.NewProxy(config)
@@ -3149,7 +3394,7 @@ func (controller *Controller) runInproxyProxy() {
 
 	// Emit one last NoticeInproxyProxyTotalActivity with the final byte counts.
 	NoticeInproxyProxyTotalActivity(
-		lastActivityConnectingClients, lastActivityConnectedClients,
+		lastAnnouncing, lastActivityConnectingClients, lastActivityConnectedClients,
 		activityTotalBytesUp, activityTotalBytesDown)
 
 	NoticeInfo("inproxy proxy: stopped")
@@ -3315,8 +3560,9 @@ func (controller *Controller) inproxyGetProxyAPIParameters(includeTacticsParamet
 
 	// TODO: include broker fronting dial parameters to be logged by the
 	// broker.
+	includeSessionID := true
 	params := getBaseAPIParameters(
-		baseParametersNoDialParameters, true, controller.config, nil)
+		baseParametersNoDialParameters, nil, includeSessionID, controller.config, nil)
 
 	if controller.config.DisableTactics {
 		return params, "", nil
@@ -3336,6 +3582,14 @@ func (controller *Controller) inproxyGetProxyAPIParameters(includeTacticsParamet
 			GetTacticsStorer(controller.config), networkID, params)
 		if err != nil {
 			return nil, "", errors.Trace(err)
+		}
+
+		p := controller.config.GetParameters().Get()
+		compressTactics := p.Bool(parameters.CompressTactics)
+		p.Close()
+
+		if compressTactics {
+			protocol.SetCompressTactics(params)
 		}
 	}
 
@@ -3372,7 +3626,7 @@ func (controller *Controller) inproxyMakeProxyWebRTCDialCoordinator() (
 // inproxyHandleTacticsPayload duplicates some tactics-handling code from
 // doHandshakeRequest.
 func (controller *Controller) inproxyHandleProxyTacticsPayload(
-	networkID string, tacticsPayload []byte) bool {
+	networkID string, compressTactics bool, tacticsPayload []byte) bool {
 
 	if controller.config.DisableTactics {
 		return false
@@ -3383,8 +3637,14 @@ func (controller *Controller) inproxyHandleProxyTacticsPayload(
 		return false
 	}
 
+	var payloadUnmarshaler func([]byte, any) error
+	payloadUnmarshaler = json.Unmarshal
+	if compressTactics {
+		payloadUnmarshaler = cbor.Unmarshal
+	}
+
 	var payload *tactics.Payload
-	err := json.Unmarshal(tacticsPayload, &payload)
+	err := payloadUnmarshaler(tacticsPayload, &payload)
 	if err != nil {
 		NoticeError("unmarshal tactics payload failed: %v", errors.Trace(err))
 		return false

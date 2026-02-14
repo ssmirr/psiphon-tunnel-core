@@ -46,18 +46,17 @@ const (
 // Proxy is the in-proxy proxying component, which relays traffic from a
 // client to a Psiphon server.
 type Proxy struct {
-	// Note: 64-bit ints used with atomic operations are placed
-	// at the start of struct to ensure 64-bit alignment.
-	// (https://golang.org/pkg/sync/atomic/#pkg-note-BUG)
-	bytesUp           int64
-	bytesDown         int64
-	peakBytesUp       int64
-	peakBytesDown     int64
-	connectingClients int32
-	connectedClients  int32
+	bytesUp           atomic.Int64
+	bytesDown         atomic.Int64
+	peakBytesUp       atomic.Int64
+	peakBytesDown     atomic.Int64
+	announcing        atomic.Int32
+	connectingClients atomic.Int32
+	connectedClients  atomic.Int32
 
 	config                *ProxyConfig
 	activityUpdateWrapper *activityUpdateWrapper
+	lastAnnouncing        int32
 	lastConnectingClients int32
 	lastConnectedClients  int32
 
@@ -68,6 +67,10 @@ type Proxy struct {
 	nextAnnounceMutex        sync.Mutex
 	nextAnnounceBrokerClient *BrokerClient
 	nextAnnounceNotBefore    time.Time
+
+	useReducedSettings bool
+	reducedStartMinute int
+	reducedEndMinute   int
 }
 
 // TODO: add PublicNetworkAddress/ListenNetworkAddress to facilitate manually
@@ -144,7 +147,8 @@ type ProxyConfig struct {
 	// HandleTacticsPayload must return true when the tacticsPayload includes
 	// new tactics, indicating that the proxy should reinitialize components
 	// controlled by tactics parameters.
-	HandleTacticsPayload func(networkID string, tacticsPayload []byte) bool
+	HandleTacticsPayload func(
+		networkID string, compressTactics bool, tacticsPayload []byte) bool
 
 	// MustUpgrade is a callback that is invoked when a MustUpgrade flag is
 	// received from the broker. When MustUpgrade is received, the proxy
@@ -164,6 +168,37 @@ type ProxyConfig struct {
 	// for a single client. When 0, there is no limit.
 	LimitDownstreamBytesPerSecond int
 
+	// ReducedStartTime specifies the local time of day (HH:MM, 24-hour, UTC)
+	// at which reduced client settings begin.
+	ReducedStartTime string
+
+	// ReducedEndTime specifies the local time of day (HH:MM, 24-hour, UTC) at
+	// which reduced client settings end.
+	ReducedEndTime string
+
+	// ReducedMaxClients specifies the maximum number of clients that are
+	// allowed to connect to the proxy during the reduced time range.
+	//
+	// Clients connected when the reduced settings begin will not be
+	// disconnected.
+	ReducedMaxClients int
+
+	// ReducedLimitUpstreamBytesPerSecond limits the upstream data transfer
+	// rate for a single client during the reduced time range. When 0,
+	// LimitUpstreamBytesPerSecond is the limit.
+	//
+	// Rates for clients already connected when the reduced settings begin or
+	// end will not change.
+	ReducedLimitUpstreamBytesPerSecond int
+
+	// ReducedLimitDownstreamBytesPerSecond limits the downstream data
+	// transfer rate for a single client during the reduced time range. When
+	// 0, LimitDownstreamBytesPerSecond is the limit.
+	//
+	// Rates for clients already connected when the reduced settings begin or
+	// end will not change.
+	ReducedLimitDownstreamBytesPerSecond int
+
 	// ActivityUpdater specifies an ActivityUpdater for activity associated
 	// with this proxy.
 	ActivityUpdater ActivityUpdater
@@ -179,12 +214,13 @@ type ProxyConfig struct {
 	OnConnectionClosed func(remoteCandidate *ConnectionStats, bandwidth *BandwidthStats)
 }
 
-// ActivityUpdater is a callback that is invoked when clients connect and
-// disconnect and periodically with data transfer updates (unless idle). This
-// callback may be used to update an activity UI. This callback should post
-// this data to another thread or handler and return immediately and not
-// block on UI updates.
+// ActivityUpdater is a callback that is invoked when the proxy announces
+// availability, when clients connect and disconnect, and periodically with
+// data transfer updates (unless idle). This callback may be used to update
+// an activity UI. This callback should post this data to another thread or
+// handler and return immediately and not block on UI updates.
 type ActivityUpdater func(
+	announcing int32,
 	connectingClients int32,
 	connectedClients int32,
 	bytesUp int64,
@@ -202,6 +238,34 @@ func NewProxy(config *ProxyConfig) (*Proxy, error) {
 		config: config,
 	}
 
+	if config.ReducedStartTime != "" ||
+		config.ReducedEndTime != "" ||
+		config.ReducedMaxClients > 0 {
+
+		startMinute, err := common.ParseTimeOfDayMinutes(config.ReducedStartTime)
+		if err != nil {
+			return nil, errors.Tracef("invalid ReducedStartTime: %v", err)
+		}
+
+		endMinute, err := common.ParseTimeOfDayMinutes(config.ReducedEndTime)
+		if err != nil {
+			return nil, errors.Tracef("invalid ReducedEndTime: %v", err)
+		}
+
+		if startMinute == endMinute {
+			return nil, errors.TraceNew("invalid ReducedStartTime/ReducedEndTime")
+		}
+
+		if config.ReducedMaxClients <= 0 ||
+			config.ReducedMaxClients > config.MaxClients {
+			return nil, errors.TraceNew("invalid ReducedMaxClients")
+		}
+
+		p.useReducedSettings = true
+		p.reducedStartMinute = startMinute
+		p.reducedEndMinute = endMinute
+	}
+
 	p.activityUpdateWrapper = &activityUpdateWrapper{p: p}
 
 	return p, nil
@@ -216,8 +280,8 @@ type activityUpdateWrapper struct {
 }
 
 func (w *activityUpdateWrapper) UpdateProgress(bytesRead, bytesWritten int64, _ int64) {
-	atomic.AddInt64(&w.p.bytesUp, bytesWritten)
-	atomic.AddInt64(&w.p.bytesDown, bytesRead)
+	w.p.bytesUp.Add(bytesWritten)
+	w.p.bytesDown.Add(bytesRead)
 }
 
 // Run runs the proxy. The proxy sends requests to the Broker announcing its
@@ -236,12 +300,39 @@ func (p *Proxy) Run(ctx context.Context) {
 
 	proxyWaitGroup := new(sync.WaitGroup)
 
+	// Capture activity updates every second, which is the required frequency
+	// for PeakUp/DownstreamBytesPerSecond. This is also a reasonable
+	// frequency for invoking the ActivityUpdater and updating UI widgets.
+
+	proxyWaitGroup.Add(1)
+	go func() {
+		defer proxyWaitGroup.Done()
+
+		p.lastAnnouncing = 0
+		p.lastConnectingClients = 0
+		p.lastConnectedClients = 0
+
+		activityUpdatePeriod := 1 * time.Second
+		ticker := time.NewTicker(activityUpdatePeriod)
+		defer ticker.Stop()
+
+	loop:
+		for {
+			select {
+			case <-ticker.C:
+				p.activityUpdate(activityUpdatePeriod)
+			case <-ctx.Done():
+				break loop
+			}
+		}
+	}()
+
 	// Launch the first proxy worker, passing a signal to be triggered once
 	// the very first announcement round trip is complete. The first round
 	// trip is awaited so that:
 	//
 	// - The first announce response will arrive with any new tactics,
-	//   which may be applied before launching additions workers.
+	//   which may be applied before launching additional workers.
 	//
 	// - The first worker gets no announcement delay and is also guaranteed to
 	//   be the shared session establisher. Since the announcement delays are
@@ -258,7 +349,7 @@ func (p *Proxy) Run(ctx context.Context) {
 	proxyWaitGroup.Add(1)
 	go func() {
 		defer proxyWaitGroup.Done()
-		p.proxyClients(ctx, signalFirstAnnounceDone)
+		p.proxyClients(ctx, signalFirstAnnounceDone, false)
 	}()
 
 	select {
@@ -270,35 +361,138 @@ func (p *Proxy) Run(ctx context.Context) {
 	// Launch the remaining workers.
 
 	for i := 0; i < p.config.MaxClients-1; i++ {
+
+		// When reduced settings are in effect, a subset of workers will pause
+		// during the reduced time period. Since ReducedMaxClients > 0 the
+		// first proxy worker is never paused.
+		workerNum := i + 1
+		reducedPause := p.useReducedSettings &&
+			workerNum >= p.config.ReducedMaxClients
+
 		proxyWaitGroup.Add(1)
-		go func() {
+		go func(reducedPause bool) {
 			defer proxyWaitGroup.Done()
-			p.proxyClients(ctx, nil)
-		}()
-	}
-
-	// Capture activity updates every second, which is the required frequency
-	// for PeakUp/DownstreamBytesPerSecond. This is also a reasonable
-	// frequency for invoking the ActivityUpdater and updating UI widgets.
-
-	p.lastConnectingClients = 0
-	p.lastConnectedClients = 0
-
-	activityUpdatePeriod := 1 * time.Second
-	ticker := time.NewTicker(activityUpdatePeriod)
-	defer ticker.Stop()
-
-loop:
-	for {
-		select {
-		case <-ticker.C:
-			p.activityUpdate(activityUpdatePeriod)
-		case <-ctx.Done():
-			break loop
-		}
+			p.proxyClients(ctx, nil, reducedPause)
+		}(reducedPause)
 	}
 
 	proxyWaitGroup.Wait()
+}
+
+func (p *Proxy) activityUpdate(period time.Duration) {
+
+	// Concurrency: activityUpdate is called by only the single goroutine
+	// created in Run.
+
+	announcing := p.announcing.Load()
+	connectingClients := p.connectingClients.Load()
+	connectedClients := p.connectedClients.Load()
+	bytesUp := p.bytesUp.Swap(0)
+	bytesDown := p.bytesDown.Swap(0)
+
+	greaterThanSwapInt64(&p.peakBytesUp, bytesUp)
+	greaterThanSwapInt64(&p.peakBytesDown, bytesDown)
+
+	stateChanged := announcing != p.lastAnnouncing ||
+		connectingClients != p.lastConnectingClients ||
+		connectedClients != p.lastConnectedClients
+
+	p.lastAnnouncing = announcing
+	p.lastConnectingClients = connectingClients
+	p.lastConnectedClients = connectedClients
+
+	if !stateChanged &&
+		bytesUp == 0 &&
+		bytesDown == 0 {
+		// Skip the activity callback on idle bytes or no change in worker state.
+		return
+	}
+
+	p.config.ActivityUpdater(
+		announcing,
+		connectingClients,
+		connectedClients,
+		bytesUp,
+		bytesDown,
+		period)
+}
+
+func greaterThanSwapInt64(addr *atomic.Int64, new int64) bool {
+
+	// Limitation: if there are two concurrent calls, the greater value could
+	// get overwritten.
+
+	old := addr.Load()
+	if new > old {
+		return addr.CompareAndSwap(old, new)
+	}
+	return false
+}
+
+func (p *Proxy) isReducedUntil() (int, time.Time) {
+	if !p.useReducedSettings {
+		return p.config.MaxClients, time.Time{}
+	}
+
+	now := time.Now().UTC()
+	minute := now.Hour()*60 + now.Minute()
+
+	isReduced := false
+	if p.reducedStartMinute < p.reducedEndMinute {
+		isReduced = minute >= p.reducedStartMinute && minute < p.reducedEndMinute
+	} else {
+		isReduced = minute >= p.reducedStartMinute || minute < p.reducedEndMinute
+	}
+
+	if !isReduced {
+		return p.config.MaxClients, time.Time{}
+	}
+
+	endHour := p.reducedEndMinute / 60
+	endMinute := p.reducedEndMinute % 60
+	endTime := time.Date(
+		now.Year(),
+		now.Month(),
+		now.Day(),
+		endHour,
+		endMinute,
+		0,
+		0,
+		now.Location(),
+	)
+	if !endTime.After(now) {
+		endTime = endTime.AddDate(0, 0, 1)
+	}
+	return p.config.ReducedMaxClients, endTime
+}
+
+func (p *Proxy) getLimits() (int, common.RateLimits) {
+
+	rateLimits := common.RateLimits{
+		ReadBytesPerSecond:  int64(p.config.LimitUpstreamBytesPerSecond),
+		WriteBytesPerSecond: int64(p.config.LimitDownstreamBytesPerSecond),
+	}
+
+	maxClients, reducedUntil := p.isReducedUntil()
+	if !reducedUntil.IsZero() {
+
+		upstream := p.config.ReducedLimitUpstreamBytesPerSecond
+		if upstream == 0 {
+			upstream = p.config.LimitUpstreamBytesPerSecond
+		}
+
+		downstream := p.config.ReducedLimitDownstreamBytesPerSecond
+		if downstream == 0 {
+			downstream = p.config.LimitDownstreamBytesPerSecond
+		}
+
+		rateLimits = common.RateLimits{
+			ReadBytesPerSecond:  int64(upstream),
+			WriteBytesPerSecond: int64(downstream),
+		}
+	}
+
+	return maxClients, rateLimits
 }
 
 // getAnnounceDelayParameters is a helper that fetches the proxy announcement
@@ -320,51 +514,8 @@ func (p *Proxy) getAnnounceDelayParameters() (time.Duration, time.Duration, floa
 
 }
 
-func (p *Proxy) activityUpdate(period time.Duration) {
-
-	connectingClients := atomic.LoadInt32(&p.connectingClients)
-	connectedClients := atomic.LoadInt32(&p.connectedClients)
-	bytesUp := atomic.SwapInt64(&p.bytesUp, 0)
-	bytesDown := atomic.SwapInt64(&p.bytesDown, 0)
-
-	greaterThanSwapInt64(&p.peakBytesUp, bytesUp)
-	greaterThanSwapInt64(&p.peakBytesDown, bytesDown)
-
-	clientsChanged := connectingClients != p.lastConnectingClients ||
-		connectedClients != p.lastConnectedClients
-
-	p.lastConnectingClients = connectingClients
-	p.lastConnectedClients = connectedClients
-
-	if !clientsChanged &&
-		bytesUp == 0 &&
-		bytesDown == 0 {
-		// Skip the activity callback on idle bytes or no change in client counts.
-		return
-	}
-
-	p.config.ActivityUpdater(
-		connectingClients,
-		connectedClients,
-		bytesUp,
-		bytesDown,
-		period)
-}
-
-func greaterThanSwapInt64(addr *int64, new int64) bool {
-
-	// Limitation: if there are two concurrent calls, the greater value could
-	// get overwritten.
-
-	old := atomic.LoadInt64(addr)
-	if new > old {
-		return atomic.CompareAndSwapInt64(addr, old, new)
-	}
-	return false
-}
-
 func (p *Proxy) proxyClients(
-	ctx context.Context, signalAnnounceDone func()) {
+	ctx context.Context, signalAnnounceDone func(), reducedPause bool) {
 
 	// Proxy one client, repeating until ctx is done.
 	//
@@ -409,6 +560,31 @@ func (p *Proxy) proxyClients(
 
 		if !p.config.WaitForNetworkConnectivity() {
 			break
+		}
+
+		// Pause designated workers during the reduced time range. In-flight
+		// announces are not interrupted and connected clients are not
+		// disconnected, so there is a gradual transition into reduced mode.
+
+		if reducedPause {
+			_, reducedUntil := p.isReducedUntil()
+			if !reducedUntil.IsZero() {
+
+				pauseDuration := time.Until(reducedUntil)
+				p.config.Logger.WithTraceFields(common.LogFields{
+					"duration": pauseDuration.String(),
+				}).Info("pause worker")
+
+				timer := time.NewTimer(pauseDuration)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+				}
+				timer.Stop()
+				if ctx.Err() != nil {
+					break
+				}
+			}
 		}
 
 		if time.Since(startLogSampleTime) >= proxyAnnounceLogSamplePeriod {
@@ -620,6 +796,8 @@ func (p *Proxy) proxyOneClient(
 	// for tactics.
 	checkTactics := signalAnnounceDone != nil
 
+	maxClients, rateLimits := p.getLimits()
+
 	// Get the base Psiphon API parameters and additional proxy metrics,
 	// including performance information, which is sent to the broker in the
 	// proxy announcment.
@@ -630,8 +808,8 @@ func (p *Proxy) proxyOneClient(
 	// returned in the proxy announcment response are associated and stored
 	// with the original network ID.
 
-	metrics, tacticsNetworkID, err := p.getMetrics(
-		checkTactics, brokerCoordinator, webRTCCoordinator)
+	metrics, tacticsNetworkID, compressTactics, err := p.getMetrics(
+		checkTactics, brokerCoordinator, webRTCCoordinator, maxClients, rateLimits)
 	if err != nil {
 		return backOff, errors.Trace(err)
 	}
@@ -682,6 +860,9 @@ func (p *Proxy) proxyOneClient(
 	//
 	// ProxyAnnounce applies an additional request timeout to facilitate
 	// long-polling.
+
+	p.announcing.Add(1)
+
 	announceStartTime := time.Now()
 	personalCompartmentIDs := brokerCoordinator.PersonalCompartmentIDs()
 	announceResponse, err := brokerClient.ProxyAnnounce(
@@ -698,6 +879,9 @@ func (p *Proxy) proxyOneClient(
 			"elapsedTime": time.Since(announceStartTime).String(),
 		}).Info("announcement request")
 	}
+
+	p.announcing.Add(-1)
+
 	if err != nil {
 		return backOff, errors.Trace(err)
 	}
@@ -712,7 +896,9 @@ func (p *Proxy) proxyOneClient(
 		// response as there may still be a match.
 
 		if p.config.HandleTacticsPayload(
-			tacticsNetworkID, announceResponse.TacticsPayload) {
+			tacticsNetworkID,
+			compressTactics,
+			announceResponse.TacticsPayload) {
 
 			p.resetNetworkDiscovery()
 		}
@@ -771,11 +957,11 @@ func (p *Proxy) proxyOneClient(
 
 	// For activity updates, indicate that a client connection is now underway.
 
-	atomic.AddInt32(&p.connectingClients, 1)
+	p.connectingClients.Add(1)
 	connected := false
 	defer func() {
 		if !connected {
-			atomic.AddInt32(&p.connectingClients, -1)
+			p.connectingClients.Add(-1)
 		}
 	}()
 
@@ -910,10 +1096,10 @@ func (p *Proxy) proxyOneClient(
 	// For activity updates, indicate that a client connection is established.
 
 	connected = true
-	atomic.AddInt32(&p.connectingClients, -1)
-	atomic.AddInt32(&p.connectedClients, 1)
+	p.connectingClients.Add(-1)
+	p.connectedClients.Add(1)
 	defer func() {
-		atomic.AddInt32(&p.connectedClients, -1)
+		p.connectedClients.Add(-1)
 	}()
 
 	// Throttle the relay connection.
@@ -924,14 +1110,15 @@ func (p *Proxy) proxyOneClient(
 	// generated by dividing the limit by MaxClients. This approach favors
 	// performance stability: each client gets the same throttling limits
 	// regardless of how many other clients are connected.
+	//
+	// Rate limits are applied only when a client connection is established;
+	// connected clients retain their initial limits even when reduced time
+	// starts or ends.
 
 	destinationConn = common.NewThrottledConn(
 		destinationConn,
 		announceResponse.NetworkProtocol.IsStream(),
-		common.RateLimits{
-			ReadBytesPerSecond:  int64(p.config.LimitUpstreamBytesPerSecond),
-			WriteBytesPerSecond: int64(p.config.LimitDownstreamBytesPerSecond),
-		})
+		rateLimits)
 
 	// Hook up bytes transferred counting for activity updates.
 
@@ -1050,7 +1237,10 @@ func (p *Proxy) proxyOneClient(
 func (p *Proxy) getMetrics(
 	includeTacticsParameters bool,
 	brokerCoordinator BrokerDialCoordinator,
-	webRTCCoordinator WebRTCDialCoordinator) (*ProxyMetrics, string, error) {
+	webRTCCoordinator WebRTCDialCoordinator,
+	maxClients int,
+	rateLimits common.RateLimits) (
+	*ProxyMetrics, string, bool, error) {
 
 	// tacticsNetworkID records the exact network ID that corresponds to the
 	// tactics tag sent in the base parameters, and is used when applying any
@@ -1058,16 +1248,18 @@ func (p *Proxy) getMetrics(
 	baseParams, tacticsNetworkID, err := p.config.GetBaseAPIParameters(
 		includeTacticsParameters)
 	if err != nil {
-		return nil, "", errors.Trace(err)
+		return nil, "", false, errors.Trace(err)
 	}
 
 	apiParams := common.APIParameters{}
 	apiParams.Add(baseParams)
 	apiParams.Add(common.APIParameters(brokerCoordinator.MetricsForBrokerRequests()))
 
+	compressTactics := protocol.GetCompressTactics(apiParams)
+
 	packedParams, err := protocol.EncodePackedAPIParameters(apiParams)
 	if err != nil {
-		return nil, "", errors.Trace(err)
+		return nil, "", false, errors.Trace(err)
 	}
 
 	return &ProxyMetrics{
@@ -1075,12 +1267,12 @@ func (p *Proxy) getMetrics(
 		ProtocolVersion:               LatestProtocolVersion,
 		NATType:                       webRTCCoordinator.NATType(),
 		PortMappingTypes:              webRTCCoordinator.PortMappingTypes(),
-		MaxClients:                    int32(p.config.MaxClients),
-		ConnectingClients:             atomic.LoadInt32(&p.connectingClients),
-		ConnectedClients:              atomic.LoadInt32(&p.connectedClients),
-		LimitUpstreamBytesPerSecond:   int64(p.config.LimitUpstreamBytesPerSecond),
-		LimitDownstreamBytesPerSecond: int64(p.config.LimitDownstreamBytesPerSecond),
-		PeakUpstreamBytesPerSecond:    atomic.LoadInt64(&p.peakBytesUp),
-		PeakDownstreamBytesPerSecond:  atomic.LoadInt64(&p.peakBytesDown),
-	}, tacticsNetworkID, nil
+		MaxClients:                    int32(maxClients),
+		ConnectingClients:             p.connectingClients.Load(),
+		ConnectedClients:              p.connectedClients.Load(),
+		LimitUpstreamBytesPerSecond:   rateLimits.ReadBytesPerSecond,
+		LimitDownstreamBytesPerSecond: rateLimits.WriteBytesPerSecond,
+		PeakUpstreamBytesPerSecond:    p.peakBytesUp.Load(),
+		PeakDownstreamBytesPerSecond:  p.peakBytesDown.Load(),
+	}, tacticsNetworkID, compressTactics, nil
 }
