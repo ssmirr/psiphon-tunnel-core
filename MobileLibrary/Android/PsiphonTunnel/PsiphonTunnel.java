@@ -197,7 +197,7 @@ public class PsiphonTunnel {
 
     private PsiphonTunnel(HostService hostService) {
         // Load the native go code embedded in psi.aar
-        hostService.loadLibrary("gojni");
+        hostService.loadLibrary("psiphontunnel");
 
         mHostService = hostService;
         mVpnMode = new AtomicBoolean(false);

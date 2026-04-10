@@ -99,7 +99,7 @@ func buildSrcJar(src string) error {
 //	AndroidManifest.xml (mandatory)
 //	classes.jar (mandatory)
 //	assets/ (optional)
-//	jni/<abi>/libgojni.so
+//	jni/<abi>/libpsiphontunnel.so
 //	R.txt (mandatory)
 //	res/ (mandatory)
 //	libs/*.jar (optional, not relevant)
@@ -148,7 +148,7 @@ func buildAAR(srcDir, androidDir string, pkgs []*packages.Package, targets []tar
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, `-keep class go.** { *; }`)
+	fmt.Fprintln(w, `-keep class psi.mahsa.go.** { *; }`)
 	if bindJavaPkg != "" {
 		fmt.Fprintln(w, `-keep class `+bindJavaPkg+`.** { *; }`)
 	} else {
@@ -212,7 +212,7 @@ func buildAAR(srcDir, androidDir string, pkgs []*packages.Package, targets []tar
 
 	for _, t := range targets {
 		toolchain := ndk.Toolchain(t.arch)
-		lib := toolchain.abi + "/libgojni.so"
+		lib := toolchain.abi + "/libpsiphontunnel.so"
 		w, err = aarwcreate("jni/" + lib)
 		if err != nil {
 			return err
@@ -346,7 +346,7 @@ func writeJar(w io.Writer, dir string) error {
 	return jarw.Close()
 }
 
-// buildAndroidSO generates an Android libgojni.so file to outputDir.
+// buildAndroidSO generates an Android libpsiphontunnel.so file to outputDir.
 // buildAndroidSO is concurrent-safe.
 func buildAndroidSO(outputDir string, arch string) error {
 	// Copy the environment variables to make this function concurrent-safe.
@@ -391,7 +391,7 @@ func buildAndroidSO(outputDir string, arch string) error {
 		"./gobind",
 		env,
 		"-buildmode=c-shared",
-		"-o="+filepath.Join(outputDir, "src", "main", "jniLibs", toolchain.abi, "libgojni.so"),
+		"-o="+filepath.Join(outputDir, "src", "main", "jniLibs", toolchain.abi, "libpsiphontunnel.so"),
 	); err != nil {
 		return err
 	}
